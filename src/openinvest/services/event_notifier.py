@@ -48,6 +48,17 @@ def send_event_alert(
     if not events:
         return ""
 
+    # 2026-09-10 老大要求：暂停事件预警推送。
+    # 此前每个事件周期推一对消息（Event Alert + verdict），一天十几次太吵；
+    # 现在只保留「非 HOLD verdict」这一条有价值的通知（过滤逻辑见
+    # send_committee_verdict_email）。需要临时恢复时设 INVEST_EVENT_ALERT=1。
+    if os.getenv("INVEST_EVENT_ALERT", "0") != "1":
+        log.info(
+            "send_event_alert: 事件预警已暂停，跳过 %d 条（仅非 HOLD verdict 会通知）",
+            len(events),
+        )
+        return ""
+
     api_base_url = api_base_url or os.getenv("INVEST_API_BASE_URL", "http://localhost:8765")
     subject = _build_subject(events)
     md = _build_markdown(
@@ -195,7 +206,23 @@ def send_committee_verdict_email(
     Returns:
         receiver 邮箱；凭据缺失 → ""；投递失败抛 EmailDeliveryError。
     """
+    # 2026-09-10 老大要求：只有非 HOLD 裁决才推送（全 HOLD 静默不打扰）。
+    # 运行失败（error）仍要通知——不能把失败也静默掉。
+    _verdicts: List[str] = []
+    _has_error = False
+    for _sym in symbols:
+        _a = by_asset.get(_sym) or {}
+        if _a.get("error"):
+            _has_error = True
+            continue
+        _verdicts.append(str((_a.get("verdict") or {}).get("verdict") or "").upper())
+    _non_hold = [v for v in _verdicts if v and v != "HOLD"]
+    if not _non_hold and not _has_error:
+        log.info("send_committee_verdict_email: 全 HOLD %s，按老大要求静默", _verdicts)
+        return ""
+
     api_base_url = api_base_url or os.getenv("INVEST_API_BASE_URL", "http://localhost:8765")
+    today = datetime.now().strftime("%Y-%m-%d")
     lines = ["# 📊 事件触发的委员会重跑结果\n"]
     if event_ids:
         lines.append(f"触发事件: `{', '.join(event_ids[:6])}`")
@@ -216,7 +243,14 @@ def send_committee_verdict_email(
             bits.append(f"建议金额 {v['alloc_cny']:+d} CNY")
         if bits:
             lines.append("- " + " · ".join(bits))
-    lines.append(f"\n详情 / transcript: {api_base_url.rstrip('/')}/committee/{task_id}")
+        # decision_id 是唯一不需要任何网络配置就能拿到详情的方式——GUI 已退役，
+        # api_base_url 链接指向的是原始 JSON（不是渲染页面），且没配置
+        # INVEST_API_BASE_URL 时会退化成本机 localhost，读邮件/DM 的设备打不开。
+        # 让任何 agent（Hermes/Claude/...）调 explain_decision 才是零配置能打开的路。
+        lines.append(f"  详情：让你的 agent 调 `explain_decision(\"{today}/{sym}\")`")
+    # api_base_url 链接是次要的技术备选（需要 INVEST_API_BASE_URL 配置成公网可达地址，
+    # 否则默认 localhost 在邮件/DM 里打不开——见上方每个资产的 explain_decision）。
+    lines.append(f"\n详情 / transcript: {api_base_url.rstrip('/')}/api/committee/{task_id}/view")
     lines.append(
         "\n---\n_这封是事件预警自动触发的委员会 verdict（补齐了 event_watch → 委员会 → "
         "邮件之前断掉的最后一环）。_"

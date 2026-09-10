@@ -49,3 +49,82 @@ def test_verdict_email_handles_errored_asset(monkeypatch):
         task_id="t1", symbols=["NDQ.AX"], by_asset=by_asset,
     )
     assert "运行失败" in sink["body"] and "boom" in sink["body"]
+
+
+def test_verdict_email_link_has_api_prefix(monkeypatch):
+    """2026-07-15 修复：漏了 /api 前缀——链接实际打不到委员会 JSON 端点
+    （/committee/<id> 落进已退役 GUI 的 SPA fallback，不是 /api/committee/<id>）。"""
+    sink: dict = {}
+    _patch_email(monkeypatch, sink)
+    by_asset = {"GC=F": {"verdict": {"verdict": "ACCUMULATE", "confidence": 0.65,
+                                     "dominant_view": "risk", "alloc_cny": 2700},
+                         "error": None}}
+    event_notifier.send_committee_verdict_email(
+        task_id="abc123", symbols=["GC=F"], by_asset=by_asset,
+        api_base_url="https://invest.example.com",
+    )
+    assert "https://invest.example.com/api/committee/abc123" in sink["body"]
+    assert "https://invest.example.com/committee/abc123" not in sink["body"]
+
+
+def test_verdict_email_has_explain_decision_fallback(monkeypatch):
+    """localhost 默认链接在邮件/DM 里打不开——explain_decision 是零配置能用的路，
+    每个资产都要有，decision_id 格式必须是 <今天日期>/<symbol>（explain_decision 契约）。"""
+    sink: dict = {}
+    _patch_email(monkeypatch, sink)
+    by_asset = {"GC=F": {"verdict": {"verdict": "ACCUMULATE", "confidence": 0.65,
+                                     "dominant_view": "risk", "alloc_cny": 2700},
+                         "error": None}}
+    event_notifier.send_committee_verdict_email(
+        task_id="abc123", symbols=["GC=F"], by_asset=by_asset,
+    )
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    assert f'explain_decision("{today}/GC=F")' in sink["body"]
+
+
+def test_verdict_email_silent_when_all_hold(monkeypatch):
+    """2026-09-10 老大要求：全 HOLD 静默不打扰（只推非 HOLD 裁决）。
+    没有邮件 → 返回空串、sink 保持空。"""
+    sink: dict = {}
+    _patch_email(monkeypatch, sink)
+    by_asset = {
+        "GC=F": {"verdict": {"verdict": "HOLD", "confidence": 0.7,
+                             "dominant_view": "quant", "alloc_cny": 0}, "error": None},
+        "510300.SS": {"verdict": {"verdict": "HOLD", "confidence": 0.6,
+                                  "dominant_view": "quant", "alloc_cny": 0}, "error": None},
+    }
+    rcv = event_notifier.send_committee_verdict_email(
+        task_id="hold123", symbols=["GC=F", "510300.SS"], by_asset=by_asset,
+    )
+    assert rcv == ""
+    assert sink == {}
+
+
+def test_verdict_email_still_sent_on_error(monkeypatch):
+    """全 HOLD 但有运行失败 → 仍要通知，不能把失败静默掉。"""
+    sink: dict = {}
+    _patch_email(monkeypatch, sink)
+    by_asset = {
+        "GC=F": {"verdict": {"verdict": "HOLD", "confidence": 0.7,
+                             "dominant_view": "quant", "alloc_cny": 0}, "error": None},
+        "NDQ.AX": {"verdict": {}, "error": "boom"},
+    }
+    rcv = event_notifier.send_committee_verdict_email(
+        task_id="err123", symbols=["GC=F", "NDQ.AX"], by_asset=by_asset,
+    )
+    assert rcv == "longsizhuo@gmail.com"
+    assert "boom" in sink["body"]
+
+
+def test_event_alert_silent_by_default(monkeypatch):
+    """事件预警默认静默（未设 INVEST_EVENT_ALERT=1 时）：不推 Discord 不发邮件。"""
+    sink: dict = {}
+    _patch_email(monkeypatch, sink)
+    monkeypatch.delenv("INVEST_EVENT_ALERT", raising=False)
+    rcv = event_notifier.send_event_alert(
+        [{"one_line_claim": "test claim", "stance": "opportunity", "severity": "mid",
+          "affected_symbols": ["GC=F"], "ts": "2026-09-10T00:00:00Z"}],
+    )
+    assert rcv == ""
+    assert sink == {}
